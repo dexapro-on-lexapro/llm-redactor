@@ -16,13 +16,11 @@ Tools:
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import uuid
 from collections import OrderedDict
 from typing import Any
 
-import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
@@ -33,7 +31,8 @@ from ..detect.types import Span, filter_by_categories
 from ..observability import log_event
 from ..redact.placeholder import PlaceholderGenerator, redact
 from ..redact.restore import restore
-from ..retry import retry_upstream
+from .client_chat import BACKENDS, delegate_chat
+from .client_profiles import ClientProfileError, resolve_client_profile
 
 server = Server("llm-redactor")
 _config: Config | None = None
@@ -126,9 +125,26 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Maximum tokens in response. Default 1024.",
                     },
+                    "client_profile": {
+                        "type": "string",
+                        "description": "Named outbound client profile from llm.clients. "
+                        "Defaults to the server profile. Controls headers, not credentials.",
+                    },
+                    "backend": {
+                        "type": "string",
+                        "enum": list(BACKENDS),
+                        "description": "API format, independent of client identity. "
+                        "Defaults to cloud_target.backend; endpoint/key remain server-controlled.",
+                    },
                 },
                 "required": ["messages"],
             },
+        ),
+        Tool(
+            name="llm.clients",
+            description="List configured outbound client profile names and supported API formats. "
+            "No inference request is made; credentials and header values are not returned.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
         Tool(
             name="redact.scrub",
@@ -217,6 +233,24 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     if name == "llm.chat":
         return await _handle_llm_chat(arguments)
+    elif name == "llm.clients":
+        config = _config or load_config()
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    {
+                        "default_client_profile": config.cloud_target.client_profile,
+                        "default_backend": config.cloud_target.backend,
+                        "backends": list(BACKENDS),
+                        "client_profiles": [
+                            {"name": name, "header_names": list(profile.headers)}
+                            for name, profile in config.cloud_target.client_profiles.items()
+                        ],
+                    }
+                ),
+            )
+        ]
     elif name == "redact.scrub":
         return await _handle_scrub(arguments)
     elif name == "redact.restore":
@@ -241,6 +275,32 @@ async def _handle_llm_chat(arguments: dict[str, Any]) -> list[TextContent]:
     messages = arguments.get("messages", [])
     model = arguments.get("model", "")
     max_tokens = arguments.get("max_tokens", 1024)
+    backend = arguments.get("backend", _config.cloud_target.backend)
+    try:
+        profile = resolve_client_profile(_config.cloud_target, arguments.get("client_profile"))
+        if backend not in BACKENDS:
+            raise ValueError("Select a supported API backend")
+        if (
+            not isinstance(messages, list)
+            or not messages
+            or any(
+                not isinstance(m, dict)
+                or set(m) != {"role", "content"}
+                or m["role"] not in ("system", "user", "assistant")
+                or not isinstance(m["content"], str)
+                for m in messages
+            )
+        ):
+            raise ValueError("Use text messages containing only role and content")
+        if (
+            not isinstance(model, str)
+            or not isinstance(max_tokens, int)
+            or isinstance(max_tokens, bool)
+            or max_tokens < 1
+        ):
+            raise ValueError("Use a model string and positive max_tokens integer")
+    except (ClientProfileError, ValueError) as error:
+        return [TextContent(type="text", text=json.dumps({"error": str(error)}))]
 
     # Step 1: Detect and redact each message.
     combined_reverse_map: dict[str, str] = {}
@@ -275,39 +335,17 @@ async def _handle_llm_chat(arguments: dict[str, Any]) -> list[TextContent]:
     )
 
     # Step 2: Forward to cloud LLM.
-    endpoint = _config.cloud_target.endpoint
-    api_key = os.environ.get(_config.cloud_target.api_key_env, "")
-
-    body: dict[str, Any] = {
-        "messages": redacted_messages,
-        "max_tokens": max_tokens,
-    }
-    if model:
-        body["model"] = model
-
-    url = f"{endpoint.rstrip('/')}/chat/completions"
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            # Retry the *already redacted* body only: redaction above already
-            # ran once, so re-sending cannot double-redact, and the retry log
-            # carries the exception type only — never the messages.
-            resp = await retry_upstream(
-                lambda: client.post(url, json=body, headers=headers),
-                operation="mcp llm.chat",
-            )
-            resp.raise_for_status()
-            cloud_response = resp.json()
-    except Exception as e:
+        cloud_response, response_text = await delegate_chat(
+            redacted_messages, model, max_tokens, _config.cloud_target, profile, backend
+        )
+    except Exception:
         return [
             TextContent(
                 type="text",
                 text=json.dumps(
                     {
-                        "error": f"LLM call failed: {e}",
+                        "error": "LLM call failed; raw provider diagnostics suppressed",
                         "redacted_messages": redacted_messages,
                         "detections": total_detections,
                     }
@@ -316,10 +354,6 @@ async def _handle_llm_chat(arguments: dict[str, Any]) -> list[TextContent]:
         ]
 
     # Step 3: Restore placeholders in response.
-    response_text = ""
-    if "choices" in cloud_response and cloud_response["choices"]:
-        response_text = cloud_response["choices"][0].get("message", {}).get("content", "")
-
     if combined_reverse_map and response_text:
         restored_text = restore(response_text, combined_reverse_map)
         _stats["restores"] += 1
@@ -333,6 +367,8 @@ async def _handle_llm_chat(arguments: dict[str, Any]) -> list[TextContent]:
                 {
                     "response": restored_text,
                     "model": cloud_response.get("model", model),
+                    "client_profile": profile,
+                    "backend": backend,
                     "detections": total_detections,
                     "placeholders_restored": len(combined_reverse_map)
                     if combined_reverse_map

@@ -1,5 +1,11 @@
 # llm-redactor
 
+This fork adds **outbound client profiles**: the master agent can select OpenCode,
+Codex, Claude Code, or owner-defined request metadata in `llm.chat`. API format is
+selected independently, including OpenAI Responses and Anthropic Messages.
+See [setup and client selection](docs/CLIENT_PROFILES.md) and the
+[AgentRouter example](examples/agentrouter-client-profiles.yaml).
+
 A privacy-preserving shim for outbound LLM requests. `llm-redactor`
 sits between an agent and an LLM endpoint and removes, masks, or
 transforms sensitive content **before** it leaves the device, then

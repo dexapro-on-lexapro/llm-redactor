@@ -49,6 +49,7 @@ from ..transport.cloud import (
     forward_chat_completion_stream,
     get_client,
 )
+from .client_profiles import ClientProfileError, client_headers
 
 
 def _placeholder_session_tag(body: dict[str, Any], pipeline: OptionBPipeline) -> str | None:
@@ -161,6 +162,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="llm-redactor", version="0.1.0", lifespan=lifespan)
+
+
+@app.exception_handler(ClientProfileError)
+async def _client_profile_error(request: Request, error: ClientProfileError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"type": "invalid_client_profile", "message": str(error)}},
+    )
+
 
 # Initialized at startup via configure().
 _pipeline: OptionBPipeline | None = None
@@ -1060,6 +1070,8 @@ async def redactor_config() -> JSONResponse:
             "cloud_target": {
                 "backend": cfg.cloud_target.backend,
                 "endpoint": cfg.cloud_target.endpoint,
+                "client_profile": cfg.cloud_target.client_profile,
+                "client_profiles": list(cfg.cloud_target.client_profiles),
             },
             "policy": {"categories": cfg.policy.categories},
         }
@@ -1123,6 +1135,7 @@ async def raw_passthrough(request: Request, path: str) -> Response:
         {"host", "transfer-encoding", "connection", "content-length", "content-encoding"}
     )
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _skip_hop}
+    headers = client_headers(config.cloud_target, headers)
     headers["content-type"] = "application/json"
     if "anthropic-version" not in headers:
         headers["anthropic-version"] = "2023-06-01"

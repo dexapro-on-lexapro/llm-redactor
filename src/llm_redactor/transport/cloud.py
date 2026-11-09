@@ -11,6 +11,7 @@ import httpx
 
 from ..config import CloudTargetConfig
 from ..retry import retry_upstream
+from .client_profiles import client_headers
 
 # Structured upstream timeout. A single flat float applies the same deadline
 # to connect, read, write, and pool — a non-streaming LLM call that takes
@@ -109,10 +110,10 @@ async def forward_chat_completion(
     api_key = os.environ.get(config.api_key_env, "")
     url = f"{config.endpoint.rstrip('/')}/chat/completions"
 
-    headers: dict[str, str] = dict(upstream_headers) if upstream_headers else {}
+    headers = client_headers(config, upstream_headers)
     headers["content-type"] = "application/json"
     if api_key and "authorization" not in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers["authorization"] = f"Bearer {api_key}"
 
     # The caller's user-agent (if any) stays in the request headers so the
     # shared client never has to hold per-request state; when absent, httpx
@@ -146,6 +147,28 @@ def _parse_json_response(resp: httpx.Response, url: str) -> dict[str, Any]:
         )
 
 
+async def forward_responses(
+    body: dict[str, Any],
+    config: CloudTargetConfig,
+    *,
+    timeout: httpx.Timeout = DEFAULT_UPSTREAM_TIMEOUT,
+    upstream_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Send an already-redacted Responses request to the owner-configured endpoint."""
+    url = f"{config.endpoint.rstrip('/')}/responses"
+    headers = client_headers(config, upstream_headers)
+    headers["content-type"] = "application/json"
+    api_key = os.environ.get(config.api_key_env, "")
+    if api_key and "authorization" not in headers:
+        headers["authorization"] = f"Bearer {api_key}"
+    resp = await retry_upstream(
+        lambda: get_client().post(url, json=body, headers=headers, timeout=timeout),
+        operation="openai responses",
+    )
+    resp.raise_for_status()
+    return _parse_json_response(resp, url)
+
+
 def _build_openai_request(
     client: httpx.AsyncClient,
     body: dict[str, Any],
@@ -155,11 +178,11 @@ def _build_openai_request(
     timeout: httpx.Timeout = DEFAULT_UPSTREAM_TIMEOUT,
 ) -> httpx.Request:
     url = f"{config.endpoint.rstrip('/')}/chat/completions"
-    headers: dict[str, str] = dict(upstream_headers) if upstream_headers else {}
+    headers = client_headers(config, upstream_headers)
     headers["content-type"] = "application/json"
     api_key = os.environ.get(config.api_key_env, "")
     if api_key and "authorization" not in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers["authorization"] = f"Bearer {api_key}"
     return client.build_request("POST", url, json=body, headers=headers, timeout=timeout)
 
 
@@ -173,7 +196,7 @@ def _build_anthropic_request(
     timeout: httpx.Timeout = DEFAULT_UPSTREAM_TIMEOUT,
 ) -> httpx.Request:
     url = f"{config.endpoint.rstrip('/')}/messages"
-    headers: dict[str, str] = dict(upstream_headers) if upstream_headers else {}
+    headers = client_headers(config, upstream_headers)
     headers["content-type"] = "application/json"
     if "anthropic-version" not in headers:
         headers["anthropic-version"] = "2023-06-01"
@@ -281,7 +304,7 @@ async def forward_anthropic_messages(
 
     # Start with forwarded headers, then overlay service essentials. The caller's
     # user-agent (if any) is left in place and rides on the request.
-    headers: dict[str, str] = dict(upstream_headers) if upstream_headers else {}
+    headers = client_headers(config, upstream_headers)
     headers["content-type"] = "application/json"
     if "anthropic-version" not in headers:
         headers["anthropic-version"] = "2023-06-01"
@@ -317,7 +340,7 @@ async def forward_anthropic_raw(
     api_key = os.environ.get(config.api_key_env, "")
     url = f"{config.endpoint.rstrip('/')}/messages"
 
-    headers: dict[str, str] = dict(upstream_headers) if upstream_headers else {}
+    headers = client_headers(config, upstream_headers)
     headers["content-type"] = "application/json"
     if "anthropic-version" not in headers:
         headers["anthropic-version"] = "2023-06-01"

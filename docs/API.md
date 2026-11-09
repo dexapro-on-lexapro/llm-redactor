@@ -15,6 +15,11 @@ One-shot: detect/redact each message (respecting `pipeline.llm_validation` and
 
 Requires `cloud_target` and API key env in the MCP process environment.
 
+Optional `client_profile` selects named outbound metadata; `backend` selects
+`openai_compat`, `openai_responses`, or `anthropic` independently. Both default to
+owner configuration. `llm.clients` lists configured names and supported formats.
+See [client profiles](CLIENT_PROFILES.md) for selection, precedence, and AgentRouter setup.
+
 ### `redact.scrub`
 
 Detect and redact a single string. Optional arguments: `use_ner` (default true),
@@ -41,6 +46,10 @@ Process-wide counters (`requests`, `detections`, `restores`, `llm_calls`).
 ---
 
 ## 2. HTTP proxy interface
+
+`X-LLM-Redactor-Client-Profile` selects a configured outbound header profile for a
+request. It is consumed locally; invalid names return 422. This changes HTTP
+metadata without changing the route or body protocol.
 
 ### `POST /v1/chat/completions`
 
