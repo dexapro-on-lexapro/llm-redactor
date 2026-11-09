@@ -1,0 +1,23 @@
+# Configure the key in the MCP process environment, never in this file/tool arguments.
+cloud_target:
+  endpoint: https://agentrouter.org/v1
+  api_key_env: AGENTROUTER_API_KEY
+  backend: openai_responses
+  client_profile: codex
+
+transport:
+  mcp: true
+  http: false
+
+pipeline:
+  opt_b_redact:
+    enabled: true
+    strict: true
+
+policy:
+  categories: [all]
+
+# MCP llm.chat example:
+# {"client_profile":"opencode","model":"gpt-6.1-sol","max_tokens":1024,
+#  "messages":[{"role":"user","content":"Reply with exactly PROFILE_OK."}]}
+# backend inherits openai_responses above, independently of client identity.

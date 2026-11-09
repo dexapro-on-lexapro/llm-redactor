@@ -31,10 +31,32 @@ class LocalModelConfig:
 
 
 @dataclass
+class ClientProfileConfig:
+    """Owner-defined request metadata; agents select names, never raw headers."""
+
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def _client_profiles() -> dict[str, ClientProfileConfig]:
+    return {
+        "default": ClientProfileConfig(),
+        "opencode": ClientProfileConfig({"user-agent": "opencode/2.2.6"}),
+        "codex": ClientProfileConfig(
+            {"user-agent": "codex_cli_rs/0.167.0", "originator": "codex_cli_rs"}
+        ),
+        "claude-code": ClientProfileConfig(
+            {"user-agent": "claude-cli/2.1.319 (external, cli)", "x-app": "cli"}
+        ),
+    }
+
+
+@dataclass
 class CloudTargetConfig:
     backend: str = "openai_compat"
     endpoint: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
+    client_profile: str = "default"
+    client_profiles: dict[str, ClientProfileConfig] = field(default_factory=_client_profiles)
 
 
 @dataclass
@@ -192,6 +214,18 @@ def _merge_dataclass(dc_type: type, raw: dict[str, Any]) -> Any:
         # If the resolved type is a dataclass, recurse.
         if isinstance(resolved_type, type) and dataclasses.is_dataclass(resolved_type):
             kwargs[f.name] = _merge_dataclass(resolved_type, val if isinstance(val, dict) else {})
+        elif typing.get_origin(resolved_type) is dict and isinstance(val, dict):
+            args = typing.get_args(resolved_type)
+            if len(args) == 2 and isinstance(args[1], type) and dataclasses.is_dataclass(args[1]):
+                # Retain built-ins while letting an owner replace/add named profiles.
+                profiles = f.default_factory()  # type: ignore[misc]
+                for name, profile in val.items():
+                    if not isinstance(profile, dict) or set(profile) != {"headers"}:
+                        raise ValueError("Client profiles must contain a headers mapping only")
+                    profiles[name] = _merge_dataclass(args[1], profile)
+                kwargs[f.name] = profiles
+            else:
+                kwargs[f.name] = val
         else:
             kwargs[f.name] = val
 
@@ -210,6 +244,8 @@ def _env_overrides(config: Config) -> Config:
         config.cloud_target.endpoint = ep
     if ep := os.environ.get("LLM_REDACTOR_CLOUD_API_KEY_ENV"):
         config.cloud_target.api_key_env = ep
+    if ep := os.environ.get("LLM_REDACTOR_CLIENT_PROFILE"):
+        config.cloud_target.client_profile = ep
     if ep := os.environ.get("LLM_REDACTOR_EPSILON"):
         config.pipeline.opt_h_dp_noise.epsilon = float(ep)
     if os.environ.get("LLM_REDACTOR_LLM_VALIDATION", "").lower() in {"1", "true", "yes"}:
@@ -251,10 +287,16 @@ def load_config(path: Path | None = None) -> Config:
     if path is None or not path.exists():
         cfg = _env_overrides(Config())
         _validate_api_key_env(cfg)
+        from .transport.client_profiles import validate_client_profiles
+
+        validate_client_profiles(cfg.cloud_target)
         return cfg
 
     raw: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
     config = _merge_dataclass(Config, raw)
     config = _env_overrides(config)
     _validate_api_key_env(config)
+    from .transport.client_profiles import validate_client_profiles
+
+    validate_client_profiles(config.cloud_target)
     return config
